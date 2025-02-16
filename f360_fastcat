@@ -1,0 +1,142 @@
+#!/usr/bin/env ruby
+require 'optparse'
+
+class FusionGCodeFixer
+  def initialize(input_files, verbose: false)
+    @input_files = input_files
+    @verbose = verbose
+  end
+
+  # Process the header block from the first file:
+  #   - Keep "%" only if it's the very first line.
+  #   - Remove all lines with F360/Fusion comments.
+  #   - Append a single comment indicating that F360 comments were removed and code optimized.
+  def process_header(lines)
+    header = []
+    lines.each do |line|
+      stripped = line.strip
+      # Keep "%" only if it's the very first line.
+      if stripped == "%" && header.empty?
+        header << stripped
+        next
+      end
+
+      # Remove any Fusion 360 comments.
+      # This covers lines mentioning Fusion, F360, feedrate details, or rapid moves limitations.
+      if stripped =~ /fusion|f360/i ||
+         stripped =~ /feedrate.*cutting moves/i ||
+         stripped =~ /machining time.*rapid moves/i ||
+         stripped =~ /unrestricted rapid moves/i
+        next
+      end
+
+      header << stripped
+    end
+
+    # Append a single comment summarizing the post-processing.
+    header << "(F360 comments removed; code optimized for full rapid feedrates and safe tool transitions.)"
+    header
+  end
+
+  # Process the body:
+  #   - Remove stray "%" lines and any F360/Fusion comment lines.
+  #   - For rapid moves (G0/G1), remove any F0 feedrate parameters.
+  def process_body(lines)
+    lines.reject do |line|
+      stripped = line.strip
+      stripped == "%" ||
+      stripped =~ /fusion|f360/i ||
+      stripped =~ /feedrate.*cutting moves/i ||
+      stripped =~ /machining time.*rapid moves/i ||
+      stripped =~ /unrestricted rapid moves/i
+    end.map do |line|
+      if line =~ /\b(G0|G1)\b/
+        # Remove any F0 feedrate parameters.
+        line = line.gsub(/\bF0(\s|$)/, ' ')
+        line.squeeze(" ").strip
+      else
+        line
+      end
+    end
+  end
+
+  # Insert a tool-change sequence between files to ensure safe transitions.
+  def tool_change_sequence(file_number)
+    [
+      "",
+      "(Tool change sequence for file #{file_number + 1})",
+      "M5",                # Stop spindle
+      "G0 Z15",            # Retract to safe height
+      "G28 G91 Z0",        # Home Z
+      "G90",
+      ""
+    ]
+  end
+
+  # Process an individual file:
+  #   - For the first file, include its processed header.
+  #   - For subsequent files, skip the header and insert a tool-change sequence.
+  def process_file(file, index)
+    lines = File.readlines(file).map(&:rstrip)
+    header_block = []
+    body_block = []
+    header_done = false
+
+    lines.each do |line|
+      if !header_done
+        if line.strip.empty?
+          header_done = true
+          next
+        else
+          header_block << line
+        end
+      else
+        body_block << line
+      end
+    end
+
+    output = []
+    if index.zero?
+      output.concat(process_header(header_block))
+      output << ""  # Ensure a blank line after header.
+    else
+      output.concat(tool_change_sequence(index))
+    end
+    output.concat(process_body(body_block))
+    output
+  end
+
+  # Concatenate all files, processing each appropriately.
+  def concatenate
+    final_output = []
+    @input_files.each_with_index do |file, idx|
+      final_output.concat(process_file(file, idx))
+    end
+    final_output << "%"  # Ensure a trailing "%" at the end.
+    final_output
+  end
+
+  def save_output(output_file)
+    File.write(output_file, concatenate.join("\n"))
+  end
+end
+
+options = { verbose: false }
+opt_parser = OptionParser.new do |opts|
+  opts.banner = "Usage: #{$0} [options] input_file1 [input_file2 ...] output_file"
+  opts.on("-v", "--verbose", "Verbose mode") { |v| options[:verbose] = v }
+end
+
+opt_parser.parse!
+
+if ARGV.size < 2
+  puts opt_parser
+  exit 1
+end
+
+output_file = ARGV.pop
+input_files = ARGV
+
+fixer = FusionGCodeFixer.new(input_files, verbose: options[:verbose])
+fixer.save_output(output_file)
+puts "Concatenation complete! Check #{output_file}."
