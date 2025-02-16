@@ -43,13 +43,6 @@ This software is provided "as-is" without any warranties or guarantees. Use it a
 
    This command will concatenate `input1.nc` and `input2.nc` into a single file `output.nc`, with Fusion 360 comments removed and rapid move feedrate corrections applied.
 
-## Installation
-
-Clone the repository and change to the project directory:
-
-    git clone https://github.com/thomergil/f360_fastcat.git
-    cd f360_fastcat
-
 ## Contributing
 
 Contributions, issues, and feature requests are welcome! Please use the GitHub issue tracker to submit bugs or suggestions.
