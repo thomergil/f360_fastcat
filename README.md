@@ -8,21 +8,25 @@ This software is provided "as-is" without any warranties or guarantees. Use it a
 
 ## Features
 
-- **Fusion 360 Comment Removal:** 
+- **Fusion 360 Comment Removal:**
   
-  Remove all comments related to Fusion 360/F360 (e.g., those discussing reduced rapid feed rates, machining time, etc.).
+  Eliminates all comments related to Fusion 360/F360 (e.g., those discussing reduced rapid feed rates, machining time, etc.).
   
-- **Rapid Move Feedrate Fix:** 
+- **Rapid Move Feedrate Optimization:**
   
-  Automatically removes any F0 feedrate parameters from G0/G1 moves so that your machine uses its full rapid speed.
+  Fast mode automatically converts cutting moves (G1) to rapid moves (G0) when above a safe height, ensuring that non-cutting moves run at full speed.
   
-- **Safe File Concatenation:** 
+- **Safe File Concatenation:**
   
-  Retains the proper initialization (header) from the first file and inserts a tool-change sequence between subsequent files to ensure safe transitions.
+  Inserts a safe tool-change sequence between subsequent files, but only if a tool change is necessary.
   
-- **Clean Output:** 
+- **Configurable Safe Height & Feedrate Threshold:**
   
-  Produces a single G-code file without unwanted initialization or comments.
+  Allows you to override the automatically detected safe height and adjust the feedrate drop threshold via command-line options. The feedrate threshold tells the optimizer what to consider a cutting move and a non-cutting move. If the feedrate suddenly drops to, say, 80% of the previous speed, it's safe to assume that we transitioned from a non-cutting move to a cutting move.
+  
+- **Dry-run Mode:**
+  
+  Enables a dry run where the final G-code is printed to the terminal without writing to an output file.
 
 ## Requirements
 
@@ -31,17 +35,39 @@ This software is provided "as-is" without any warranties or guarantees. Use it a
 ## Usage
 
 1. **Make the script executable** (if necessary):
-   
-   - Use `chmod +x f360_fastcat` in your terminal.
-   
-2. **Run the script** by specifying one or more input G-code files and an output file.  
-   Optionally, use the `-v` or `--verbose` flag for verbose output.
 
-   **Example:**
+   - Use `chmod +x f360_fastcat` in your terminal.
+
+2. **Run the script** by specifying one or more input G-code files and an output file. The following options are available:
+
+   - `-v` or `--verbose`: Enable verbose output.
+   - `--fast`: Enable rapid move optimizations.
+   - `--safe-height VALUE`: Override the detected safe height (in mm).
+   - `--feedrate-threshold VALUE`: Adjust the feedrate drop threshold (default is 0.75).
+   - `--dry-run`: Print the final G-code to the terminal without writing to a file.
+
+## Examples
+   Concatenate files with default settings:
 
        ./f360_fastcat input1.nc input2.nc output.nc
 
-   This command will concatenate `input1.nc` and `input2.nc` into a single file `output.nc`, with Fusion 360 comments removed and rapid move feedrate corrections applied.
+   Enable fast mode with rapid move optimizations:
+
+   ```bash
+   ./f360_fastcat --fast input1.nc input2.nc output.nc
+   ```
+
+   Use a custom safe height of 10mm:
+
+   ```bash
+   ./f360_fastcat --fast --safe-height 10 input1.nc input2.nc output.nc
+   ```
+
+   Adjust the feedrate threshold to 0.8 and perform a dry run:
+
+   ```bash
+   ./f360_fastcat --fast --feedrate-threshold 0.8 --dry-run input1.nc input2.nc output.nc
+   ```
 
 ## Contributing
 
@@ -50,3 +76,6 @@ Contributions, issues, and feature requests are welcome! Please use the GitHub i
 ## License
 
 This project is released under the MIT License.
+
+
+
