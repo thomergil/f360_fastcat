@@ -1,4 +1,6 @@
 #!/usr/bin/env ruby
+# frozen_string_literal: true
+
 require 'optparse'
 require 'logger'
 
@@ -6,24 +8,25 @@ require 'logger'
 DEFAULT_FEEDRATE_THRESHOLD = 0.75
 DEFAULT_SAFE_HEIGHT        = 15.0
 MIN_SAFE_HEIGHT           = 1.0
-TOOL_CHANGE_PREFIX        = "(Tool change sequence for file"
-COMMAND_STOP_SPINDLE      = "M5"
-COMMAND_RETRACT           = "G0 Z"
-COMMAND_HOME_Z            = "G28 G91 Z0"
-COMMAND_ABSOLUTE_MODE     = "G90"
+TOOL_CHANGE_PREFIX        = '(Tool change sequence for file'
+COMMAND_STOP_SPINDLE      = 'M5'
+COMMAND_RETRACT           = 'G0 Z'
+COMMAND_HOME_Z            = 'G28 G91 Z0'
+COMMAND_ABSOLUTE_MODE     = 'G90'
 
 class FusionGCodeFixer
-  def initialize(input_files, verbose: false, fast: false, safe_height_override: nil, feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD, dry_run: false)
+  def initialize(input_files, verbose: false, fast: false, safe_height_override: nil,
+                 feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD, dry_run: false)
     @input_files = input_files
     @verbose = verbose
     @fast = fast
     @safe_height_override = safe_height_override
     @feedrate_threshold = feedrate_threshold
     @dry_run = dry_run
-    @tool_numbers = {}  # Cache for tool numbers
+    @tool_numbers = {} # Cache for tool numbers
     @logger = Logger.new($stdout)
     @logger.level = verbose ? Logger::INFO : Logger::WARN
-    @logger.formatter = proc { |severity, datetime, progname, msg| "#{msg}\n" }
+    @logger.formatter = proc { |_severity, _datetime, _progname, msg| "#{msg}\n" }
 
     validate_files
   end
@@ -41,8 +44,8 @@ class FusionGCodeFixer
       tool_info = { number: nil, description: nil }
       File.readlines(file).each do |line|
         if line =~ /\(T(\d+)\s+([^)]+)\)/
-          tool_info[:number] = $1.to_i
-          tool_info[:description] = $2.strip
+          tool_info[:number] = ::Regexp.last_match(1).to_i
+          tool_info[:description] = ::Regexp.last_match(2).strip
           return tool_info
         end
       end
@@ -62,13 +65,11 @@ class FusionGCodeFixer
 
     lines.each do |line|
       if line =~ /\bZ([-\d.]+)/
-        new_z = $1.to_f
+        new_z = ::Regexp.last_match(1).to_f
         feedrate = nil
-        feedrate = $1.to_f if line =~ /F([\d.]+)/
-        if feedrate && last_feedrate
-          if feedrate < last_feedrate * @feedrate_threshold && current_z
-            potential_heights << current_z
-          end
+        feedrate = ::Regexp.last_match(1).to_f if line =~ /F([\d.]+)/
+        if feedrate && last_feedrate && (feedrate < last_feedrate * @feedrate_threshold && current_z)
+          potential_heights << current_z
         end
         current_z = new_z
         last_feedrate = feedrate if feedrate
@@ -91,14 +92,12 @@ class FusionGCodeFixer
     return [stripped, current_z] if stripped.empty? || stripped.start_with?('(')
 
     if stripped =~ /\bZ([-\d.]+)/
-      current_z = $1.to_f
+      current_z = ::Regexp.last_match(1).to_f
     end
 
-    if stripped =~ /\b(G0|G1)\b/
-      if @fast && current_z && current_z >= safe_height
-        stripped = stripped.gsub(/G1/, 'G0').gsub(/F[\d.]+/, '')
-        stripped = stripped.squeeze(" ").strip
-      end
+    if stripped =~ (/\b(G0|G1)\b/) && (@fast && current_z && current_z >= safe_height)
+      stripped = stripped.gsub(/G1/, 'G0').gsub(/F[\d.]+/, '')
+      stripped = stripped.squeeze(' ').strip
     end
 
     [stripped, current_z]
@@ -106,14 +105,14 @@ class FusionGCodeFixer
 
   def tool_change_sequence(file_number, safe_height)
     [
-      "",
+      '',
       "#{TOOL_CHANGE_PREFIX} #{file_number + 1})",
       COMMAND_STOP_SPINDLE,
-      "M0 (Pause for tool change)",
+      'M0 (Pause for tool change)',
       "#{COMMAND_RETRACT}#{safe_height}",
       COMMAND_HOME_Z,
       COMMAND_ABSOLUTE_MODE,
-      ""
+      ''
     ]
   end
 
@@ -137,10 +136,10 @@ class FusionGCodeFixer
       @logger.info("No tool change detected between file #{index} and file #{index + 1}")
       # For same tool transitions, add a safe retract
       output.concat([
-        "",
-        "G0 Z#{safe_height}",  # Safe retract
-        ""
-      ])
+                      '',
+                      "G0 Z#{safe_height}", # Safe retract
+                      ''
+                    ])
     end
 
     first_move = false
@@ -151,23 +150,24 @@ class FusionGCodeFixer
       next if stripped.empty?
 
       # Skip program start/end markers
-      next if stripped == '%'   # Program start/end marker
+      next if stripped == '%' # Program start/end marker
       next if stripped == 'M30' && !last_file # Program end and rewind command; keep it at the end
 
       # Always skip comments
       next if stripped.start_with?('(')   # Skip all comments
       next if stripped.match?(/^G28/)     # Skip homing commands
       next if stripped.match?(/^Z/)       # Skip Z retracts
+
       if stripped.match?(/^G90/)          # Skip absolute mode if already set
         next if mode_set
+
         mode_set = true
       end
       if stripped.match?(/^G91/)          # Skip relative mode if already set
         next if mode_set
+
         mode_set = true
       end
-
-
 
       # For files using the same tool, skip redundant initialization codes:
       unless needs_header
@@ -177,7 +177,7 @@ class FusionGCodeFixer
         next if stripped.match?(/^G54/) # Skip work coordinate system selection
 
         # Skip tool and spindle related commands:
-        next if stripped.start_with?('T')   # Tool selection commands
+        next if stripped.start_with?('T') # Tool selection commands
         next if stripped.start_with?('M') && !last_file && !stripped.start_with?('M3')
 
         # Skip Z moves in subsequent files
@@ -185,7 +185,7 @@ class FusionGCodeFixer
       end
 
       # Track first movement command
-      if !first_move && (stripped.start_with?('G0', 'G1', 'X', 'Y', 'Z'))
+      if !first_move && stripped.start_with?('G0', 'G1', 'X', 'Y', 'Z')
         first_move = true
       end
 
@@ -195,7 +195,6 @@ class FusionGCodeFixer
 
     output
   end
-
 
   def concatenate
     # Analyze safe height from first file
@@ -218,11 +217,11 @@ class FusionGCodeFixer
   def save_output(output_file)
     final_output = concatenate
     if final_output.empty? || !final_output.any? { |line| line =~ /\bG\d+\b/ }
-      raise "Sanity check failed: Output does not contain any G-code commands."
+      raise 'Sanity check failed: Output does not contain any G-code commands.'
     end
 
     if @dry_run
-      @logger.info("Dry run mode enabled. The following output would be written:")
+      @logger.info('Dry run mode enabled. The following output would be written:')
       puts final_output.join("\n")
     else
       File.write(output_file, final_output.join("\n"))
@@ -239,12 +238,15 @@ options = {
 }
 
 opt_parser = OptionParser.new do |opts|
-  opts.banner = "Usage: #{$0} [options] input_file1 [input_file2 ...] output_file"
-  opts.on("-v", "--verbose", "Enable verbose mode") { options[:verbose] = true }
-  opts.on("--fast", "Enable fast mode (optimize non-cutting moves)") { options[:fast] = true }
-  opts.on("--safe-height VALUE", Float, "Override safe height (in mm)") { |v| options[:safe_height] = v }
-  opts.on("--feedrate-threshold VALUE", Float, "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") { |v| options[:feedrate_threshold] = v }
-  opts.on("--dry-run", "Dry run mode: display output without writing to file") { options[:dry_run] = true }
+  opts.banner = "Usage: #{$PROGRAM_NAME} [options] input_file1 [input_file2 ...] output_file"
+  opts.on('-v', '--verbose', 'Enable verbose mode') { options[:verbose] = true }
+  opts.on('--fast', 'Enable fast mode (optimize non-cutting moves)') { options[:fast] = true }
+  opts.on('--safe-height VALUE', Float, 'Override safe height (in mm)') { |v| options[:safe_height] = v }
+  opts.on('--feedrate-threshold VALUE', Float,
+          "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") do |v|
+    options[:feedrate_threshold] = v
+  end
+  opts.on('--dry-run', 'Dry run mode: display output without writing to file') { options[:dry_run] = true }
 end
 
 opt_parser.parse!
