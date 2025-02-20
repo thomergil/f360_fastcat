@@ -38,6 +38,16 @@ class FusionGCodeFixer
     header
   end
 
+  # Extract tool number from G-code lines
+  def extract_tool_number(lines)
+    lines.each do |line|
+      if line =~ /T(\d+)/
+        return $1.to_i
+      end
+    end
+    nil
+  end
+
   # Process the body:
   #   - Remove stray "%" lines and any F360/Fusion comment lines.
   #   - For rapid moves (G0/G1), remove any F0 feedrate parameters.
@@ -95,14 +105,21 @@ class FusionGCodeFixer
       end
     end
 
+
+    # Get tool numbers for current and next file
+    current_tool = index.zero? ? nil : extract_tool_number(File.readlines(@input_files[index-1]))
+    next_tool = extract_tool_number(lines)
+
     output = []
     if index.zero?
       output.concat(process_header(header_block))
       output << ""  # Ensure a blank line after header.
-    else
+    elsif current_tool != next_tool  # Only add tool change if tools are different
       output.concat(tool_change_sequence(index))
     end
     output.concat(process_body(body_block))
+    puts "File #{index + 1}: Using tool T#{next_tool}" if @verbose
+
     output
   end
 
@@ -139,4 +156,4 @@ input_files = ARGV
 
 fixer = FusionGCodeFixer.new(input_files, verbose: options[:verbose])
 fixer.save_output(output_file)
-puts "Concatenation complete! Check #{output_file}."
+puts "Output #{output_file}"
