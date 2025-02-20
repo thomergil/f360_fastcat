@@ -49,24 +49,24 @@ This software is provided "as-is" without any warranties or guarantees. Use it a
 ## Examples
    Concatenate files with default settings:
 
-       ./f360_fastcat input1.nc input2.nc output.nc
+    f360_fastcat input1.nc input2.nc output.nc
 
    Enable fast mode with rapid move optimizations:
 
    ```bash
-   ./f360_fastcat --fast input1.nc input2.nc output.nc
+   f360_fastcat --fast input1.nc input2.nc output.nc
    ```
 
    Use a custom safe height of 10mm:
 
    ```bash
-   ./f360_fastcat --fast --safe-height 10 input1.nc input2.nc output.nc
+   f360_fastcat --fast --safe-height 10 input1.nc input2.nc output.nc
    ```
 
    Adjust the feedrate threshold to 0.8 and perform a dry run:
 
    ```bash
-   ./f360_fastcat --fast --feedrate-threshold 0.8 --dry-run input1.nc input2.nc output.nc
+   f360_fastcat --fast --feedrate-threshold 0.8 --dry-run input1.nc input2.nc output.nc
    ```
 
 ## Contributing
