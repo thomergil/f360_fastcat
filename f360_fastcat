@@ -76,7 +76,12 @@ class FusionGCodeFixer
     end
 
     potential_heights.reject! { |h| h < MIN_SAFE_HEIGHT }
-    height = potential_heights.max || DEFAULT_SAFE_HEIGHT
+    height = potential_heights.max
+    unless height
+      @logger.warn("No valid Z moves found, defaulting to #{DEFAULT_SAFE_HEIGHT}mm")
+      height = DEFAULT_SAFE_HEIGHT
+    end
+
     @logger.info("Found safe height: #{height}mm")
     height
   end
@@ -104,6 +109,7 @@ class FusionGCodeFixer
       "",
       "#{TOOL_CHANGE_PREFIX} #{file_number + 1})",
       COMMAND_STOP_SPINDLE,
+      "M0 (Pause for tool change)",
       "#{COMMAND_RETRACT}#{safe_height}",
       COMMAND_HOME_Z,
       COMMAND_ABSOLUTE_MODE,
@@ -150,7 +156,7 @@ class FusionGCodeFixer
 
       # Always skip comments
       next if stripped.start_with?('(')   # Skip all comments
-      next if stripped.match?(/^G28/) # Skip homing commands
+      next if stripped.match?(/^G28/)     # Skip homing commands
       next if stripped.match?(/^Z/)       # Skip Z retracts
       if stripped.match?(/^G90/)          # Skip absolute mode if already set
         next if mode_set
@@ -172,8 +178,7 @@ class FusionGCodeFixer
 
         # Skip tool and spindle related commands:
         next if stripped.start_with?('T')   # Tool selection commands
-        next if stripped.start_with?('S')   # Spindle speed settings
-        next if stripped.start_with?('M') && !last_file # Spindle and misc commands
+        next if stripped.start_with?('M') && !last_file && !stripped.start_with?('M3')
 
         # Skip Z moves in subsequent files
         next if !index.zero? && stripped.start_with?('Z')
