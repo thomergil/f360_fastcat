@@ -6,6 +6,9 @@
 
 This software is provided "as-is" without any warranties or guarantees. Use it at your own risk. The author(s) assume no responsibility or liability for any **damage to your CNC machine or other equipment** resulting from the use of this script. Always thoroughly verify, simulate, and review the generated G-code before running it on your machine. **Use of this script may lead to unexpected machine behavior, damage, or personal injury.**
 
+## LIMITATIONS
+If your CNC workflow uses coolant commands (e.g., `M7`, `M8`, `M9`), this script may remove or skip them. You might need to modify the G-code filtering logic in `f360_fastcat` if you wish to preserve or re-enable coolant for subsequent operations. You are welcome to submit a MR.
+
 ## Features
 
 - **Fusion 360 Comment Removal:**
