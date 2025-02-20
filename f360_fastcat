@@ -1,91 +1,142 @@
 #!/usr/bin/env ruby
 require 'optparse'
+require 'logger'
+
+# Constants
+DEFAULT_FEEDRATE_THRESHOLD = 0.75
+DEFAULT_SAFE_HEIGHT        = 15.0
+MIN_SAFE_HEIGHT            = 1.0
+F360_COMMENT_REMOVED       = "(F360 comments removed; code optimized for speeds and minimal tool changes.)"
+PERCENT_MARKER             = "%"
+TOOL_CHANGE_PREFIX         = "(Tool change sequence for file"
+COMMAND_STOP_SPINDLE       = "M5"
+COMMAND_RETRACT            = "G0 Z"
+COMMAND_HOME_Z             = "G28 G91 Z0"
+COMMAND_ABSOLUTE_MODE      = "G90"
+F360_REGEX                 = /fusion|f360/i
+FEEDRATE_CUTTING_REGEX     = /feedrate.*cutting moves/i
+MACHINING_TIME_REGEX       = /machining time.*rapid moves/i
+UNRESTRICTED_RAPID_REGEX   = /unrestricted rapid moves/i
 
 class FusionGCodeFixer
-  def initialize(input_files, verbose: false)
+  def initialize(input_files, verbose: false, fast: false, safe_height_override: nil, feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD, dry_run: false)
     @input_files = input_files
     @verbose = verbose
+    @fast = fast
+    @safe_height_override = safe_height_override
+    @feedrate_threshold = feedrate_threshold
+    @dry_run = dry_run
+    @tool_numbers = {}  # Cache for tool numbers
+    @logger = Logger.new($stdout)
+    @logger.level = verbose ? Logger::INFO : Logger::WARN
+    @logger.formatter = proc { |severity, datetime, progname, msg| "#{msg}\n" }
+
+
+    validate_files
   end
 
-  # Process the header block from the first file:
-  #   - Keep "%" only if it's the very first line.
-  #   - Remove all lines with F360/Fusion comments.
-  #   - Append a single comment indicating that F360 comments were removed and code optimized.
+  def validate_files
+    @input_files.each do |file|
+      unless File.readable?(file)
+        raise ArgumentError, "Cannot read file: #{file}"
+      end
+    end
+  end
+
   def process_header(lines)
     header = []
     lines.each do |line|
       stripped = line.strip
-      # Keep "%" only if it's the very first line.
-      if stripped == "%" && header.empty?
+      if stripped == PERCENT_MARKER && header.empty?
         header << stripped
         next
       end
 
-      # Remove any Fusion 360 comments.
-      # This covers lines mentioning Fusion, F360, feedrate details, or rapid moves limitations.
-      if stripped =~ /fusion|f360/i ||
-         stripped =~ /feedrate.*cutting moves/i ||
-         stripped =~ /machining time.*rapid moves/i ||
-         stripped =~ /unrestricted rapid moves/i
+      if stripped =~ F360_REGEX ||
+         stripped =~ FEEDRATE_CUTTING_REGEX ||
+         stripped =~ MACHINING_TIME_REGEX ||
+         stripped =~ UNRESTRICTED_RAPID_REGEX
         next
       end
 
       header << stripped
     end
-
-    # Append a single comment summarizing the post-processing.
-    header << "(F360 comments removed; code optimized for full rapid feedrates and safe tool transitions.)"
+    header << F360_COMMENT_REMOVED
     header
   end
 
-  # Extract tool number from G-code lines
-  def extract_tool_number(lines)
+  def get_tool_number(file)
+    @tool_numbers[file] ||= begin
+      File.readlines(file).each do |line|
+        if line =~ /T(\d+)/
+          return $1.to_i
+        end
+      end
+      nil
+    end
+  end
+
+  def analyze_safe_heights(lines)
+    if @safe_height_override
+      @logger.info("Using user-specified safe height: #{@safe_height_override}mm")
+      return @safe_height_override
+    end
+
+    potential_heights = []
+    current_z = nil
+    last_feedrate = nil
+
     lines.each do |line|
-      if line =~ /T(\d+)/
-        return $1.to_i
+      if line =~ /\bZ([-\d.]+)/
+        new_z = $1.to_f
+        feedrate = nil
+        feedrate = $1.to_f if line =~ /F([\d.]+)/
+        if feedrate && last_feedrate
+          if feedrate < last_feedrate * @feedrate_threshold && current_z
+            potential_heights << current_z
+          end
+        end
+        current_z = new_z
+        last_feedrate = feedrate if feedrate
       end
     end
-    nil
+
+    potential_heights.reject! { |h| h < MIN_SAFE_HEIGHT }
+    height = potential_heights.max || DEFAULT_SAFE_HEIGHT
+    @logger.info("Found safe height: #{height}mm")
+    height
   end
 
-  # Process the body:
-  #   - Remove stray "%" lines and any F360/Fusion comment lines.
-  #   - For rapid moves (G0/G1), remove any F0 feedrate parameters.
-  def process_body(lines)
-    lines.reject do |line|
-      stripped = line.strip
-      stripped == "%" ||
-      stripped =~ /fusion|f360/i ||
-      stripped =~ /feedrate.*cutting moves/i ||
-      stripped =~ /machining time.*rapid moves/i ||
-      stripped =~ /unrestricted rapid moves/i
-    end.map do |line|
-      if line =~ /\b(G0|G1)\b/
-        # Remove any F0 feedrate parameters.
-        line = line.gsub(/\bF0(\s|$)/, ' ')
-        line.squeeze(" ").strip
-      else
-        line
+  def optimize_line(line, current_z, safe_height)
+    stripped = line.strip
+    return [stripped, current_z] if stripped.empty? || stripped.start_with?('(')
+
+    if stripped =~ /\bZ([-\d.]+)/
+      current_z = $1.to_f
+    end
+
+    if stripped =~ /\b(G0|G1)\b/
+      if @fast && current_z && current_z >= safe_height
+        stripped = stripped.gsub(/G1/, 'G0').gsub(/F[\d.]+/, '')
+        stripped = stripped.squeeze(" ").strip
       end
     end
+
+    [stripped, current_z]
   end
 
-  # Insert a tool-change sequence between files to ensure safe transitions.
-  def tool_change_sequence(file_number)
+  def tool_change_sequence(file_number, safe_height)
     [
       "",
-      "(Tool change sequence for file #{file_number + 1})",
-      "M5",                # Stop spindle
-      "G0 Z15",            # Retract to safe height
-      "G28 G91 Z0",        # Home Z
-      "G90",
+      "#{TOOL_CHANGE_PREFIX} #{file_number + 1})",
+      COMMAND_STOP_SPINDLE,
+      "#{COMMAND_RETRACT}#{safe_height}",
+      COMMAND_HOME_Z,
+      COMMAND_ABSOLUTE_MODE,
       ""
     ]
   end
 
-  # Process an individual file:
-  #   - For the first file, include its processed header.
-  #   - For subsequent files, skip the header and insert a tool-change sequence.
   def process_file(file, index)
     lines = File.readlines(file).map(&:rstrip)
     header_block = []
@@ -105,43 +156,73 @@ class FusionGCodeFixer
       end
     end
 
-
-    # Get tool numbers for current and next file
-    current_tool = index.zero? ? nil : extract_tool_number(File.readlines(@input_files[index-1]))
-    next_tool = extract_tool_number(lines)
+    safe_height = analyze_safe_heights(body_block)
+    current_tool = index.zero? ? nil : get_tool_number(@input_files[index - 1])
+    next_tool = get_tool_number(file)
 
     output = []
     if index.zero?
       output.concat(process_header(header_block))
-      output << ""  # Ensure a blank line after header.
-    elsif current_tool != next_tool  # Only add tool change if tools are different
-      output.concat(tool_change_sequence(index))
+      output << ""
+    elsif current_tool && next_tool && current_tool != next_tool
+      output.concat(tool_change_sequence(index, safe_height))
+    else
+      @logger.info("No tool change detected between file #{index} and file #{index + 1}")
     end
-    output.concat(process_body(body_block))
-    puts "File #{index + 1}: Using tool T#{next_tool}" if @verbose
 
+    current_z = nil
+    body_block.each do |line|
+      optimized_line, new_z = optimize_line(line, current_z, safe_height)
+      current_z = new_z if new_z
+      output << optimized_line
+    end
+
+    @logger.info("File #{index + 1}: Using tool T#{next_tool}, safe height #{safe_height}mm")
     output
   end
 
-  # Concatenate all files, processing each appropriately.
   def concatenate
     final_output = []
     @input_files.each_with_index do |file, idx|
-      final_output.concat(process_file(file, idx))
+      processed = process_file(file, idx)
+      final_output.concat(processed)
     end
-    final_output << "%"  # Ensure a trailing "%" at the end.
+    final_output = final_output.reject { |line| line.strip == "%" }
+    final_output.unshift(PERCENT_MARKER)
+    final_output.push(PERCENT_MARKER)
     final_output
   end
 
   def save_output(output_file)
-    File.write(output_file, concatenate.join("\n"))
+    final_output = concatenate
+    if final_output.empty? || !final_output.any? { |line| line =~ /\bG\d+\b/ }
+      raise "Sanity check failed: Output does not contain any G-code commands."
+    end
+
+    if @dry_run
+      @logger.info("Dry run mode enabled. The following output would be written:")
+      puts final_output.join("\n")
+    else
+      File.write(output_file, final_output.join("\n"))
+    end
   end
 end
 
-options = { verbose: false }
+options = {
+  verbose: false,
+  fast: false,
+  safe_height: nil,
+  feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD,
+  dry_run: false
+}
+
 opt_parser = OptionParser.new do |opts|
   opts.banner = "Usage: #{$0} [options] input_file1 [input_file2 ...] output_file"
-  opts.on("-v", "--verbose", "Verbose mode") { |v| options[:verbose] = v }
+  opts.on("-v", "--verbose", "Enable verbose mode") { options[:verbose] = true }
+  opts.on("--fast", "Enable fast mode (optimize non-cutting moves)") { options[:fast] = true }
+  opts.on("--safe-height VALUE", Float, "Override safe height (in mm)") { |v| options[:safe_height] = v }
+  opts.on("--feedrate-threshold VALUE", Float, "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") { |v| options[:feedrate_threshold] = v }
+  opts.on("--dry-run", "Dry run mode: display output without writing to file") { options[:dry_run] = true }
 end
 
 opt_parser.parse!
@@ -154,6 +235,13 @@ end
 output_file = ARGV.pop
 input_files = ARGV
 
-fixer = FusionGCodeFixer.new(input_files, verbose: options[:verbose])
+fixer = FusionGCodeFixer.new(
+  input_files,
+  verbose: options[:verbose],
+  fast: options[:fast],
+  safe_height_override: options[:safe_height],
+  feedrate_threshold: options[:feedrate_threshold],
+  dry_run: options[:dry_run]
+)
 fixer.save_output(output_file)
-puts "Output #{output_file}"
+puts "Output written to #{output_file}" unless options[:dry_run]
