@@ -5,18 +5,12 @@ require 'logger'
 # Constants
 DEFAULT_FEEDRATE_THRESHOLD = 0.75
 DEFAULT_SAFE_HEIGHT        = 15.0
-MIN_SAFE_HEIGHT            = 1.0
-F360_COMMENT_REMOVED       = "(F360 comments removed; code optimized for speeds and minimal tool changes.)"
-PERCENT_MARKER             = "%"
-TOOL_CHANGE_PREFIX         = "(Tool change sequence for file"
-COMMAND_STOP_SPINDLE       = "M5"
-COMMAND_RETRACT            = "G0 Z"
-COMMAND_HOME_Z             = "G28 G91 Z0"
-COMMAND_ABSOLUTE_MODE      = "G90"
-F360_REGEX                 = /fusion|f360/i
-FEEDRATE_CUTTING_REGEX     = /feedrate.*cutting moves/i
-MACHINING_TIME_REGEX       = /machining time.*rapid moves/i
-UNRESTRICTED_RAPID_REGEX   = /unrestricted rapid moves/i
+MIN_SAFE_HEIGHT           = 1.0
+TOOL_CHANGE_PREFIX        = "(Tool change sequence for file"
+COMMAND_STOP_SPINDLE      = "M5"
+COMMAND_RETRACT           = "G0 Z"
+COMMAND_HOME_Z            = "G28 G91 Z0"
+COMMAND_ABSOLUTE_MODE     = "G90"
 
 class FusionGCodeFixer
   def initialize(input_files, verbose: false, fast: false, safe_height_override: nil, feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD, dry_run: false)
@@ -31,7 +25,6 @@ class FusionGCodeFixer
     @logger.level = verbose ? Logger::INFO : Logger::WARN
     @logger.formatter = proc { |severity, datetime, progname, msg| "#{msg}\n" }
 
-
     validate_files
   end
 
@@ -43,36 +36,17 @@ class FusionGCodeFixer
     end
   end
 
-  def process_header(lines)
-    header = []
-    lines.each do |line|
-      stripped = line.strip
-      if stripped == PERCENT_MARKER && header.empty?
-        header << stripped
-        next
-      end
-
-      if stripped =~ F360_REGEX ||
-         stripped =~ FEEDRATE_CUTTING_REGEX ||
-         stripped =~ MACHINING_TIME_REGEX ||
-         stripped =~ UNRESTRICTED_RAPID_REGEX
-        next
-      end
-
-      header << stripped
-    end
-    header << F360_COMMENT_REMOVED
-    header
-  end
-
   def get_tool_number(file)
     @tool_numbers[file] ||= begin
+      tool_info = { number: nil, description: nil }
       File.readlines(file).each do |line|
-        if line =~ /T(\d+)/
-          return $1.to_i
+        if line =~ /\(T(\d+)\s+([^)]+)\)/
+          tool_info[:number] = $1.to_i
+          tool_info[:description] = $2.strip
+          return tool_info
         end
       end
-      nil
+      tool_info
     end
   end
 
@@ -137,59 +111,102 @@ class FusionGCodeFixer
     ]
   end
 
-  def process_file(file, index)
+  def process_file(file, index, safe_height)
     lines = File.readlines(file).map(&:rstrip)
-    header_block = []
-    body_block = []
-    header_done = false
-
-    lines.each do |line|
-      if !header_done
-        if line.strip.empty?
-          header_done = true
-          next
-        else
-          header_block << line
-        end
-      else
-        body_block << line
-      end
-    end
-
-    safe_height = analyze_safe_heights(body_block)
     current_tool = index.zero? ? nil : get_tool_number(@input_files[index - 1])
+    last_file = (index == @input_files.size - 1)
     next_tool = get_tool_number(file)
 
+    # If tools are different, we need a full header G-codes
+    needs_header = index == 0 || (current_tool && next_tool && current_tool[:number] != next_tool[:number])
+
     output = []
-    if index.zero?
-      output.concat(process_header(header_block))
-      output << ""
-    elsif current_tool && next_tool && current_tool != next_tool
-      output.concat(tool_change_sequence(index, safe_height))
-    else
-      @logger.info("No tool change detected between file #{index} and file #{index + 1}")
-    end
-
     current_z = nil
-    body_block.each do |line|
-      optimized_line, new_z = optimize_line(line, current_z, safe_height)
-      current_z = new_z if new_z
-      output << optimized_line
+
+    # If tool is changing, add tool change sequence
+    if needs_header && !index.zero?
+      @logger.info("Tool change detected from T#{current_tool[:number]} (#{current_tool[:description]}) to T#{next_tool[:number]} (#{next_tool[:description]})")
+      output.concat(tool_change_sequence(index, safe_height))
+    elsif index > 0
+      @logger.info("No tool change detected between file #{index} and file #{index + 1}")
+      # For same tool transitions, add a safe retract
+      output.concat([
+        "",
+        "G0 Z#{safe_height}",  # Safe retract
+        ""
+      ])
     end
 
-    @logger.info("File #{index + 1}: Using tool T#{next_tool}, safe height #{safe_height}mm")
+    first_move = false
+    mode_set = false
+
+    lines.each do |line|
+      stripped = line.strip
+      next if stripped.empty?
+
+      # Skip program start/end markers
+      next if stripped == '%'   # Program start/end marker
+      next if stripped == 'M30' && !last_file # Program end and rewind command; keep it at the end
+
+      # Always skip comments
+      next if stripped.start_with?('(')   # Skip all comments
+      next if stripped.match?(/^G28/) # Skip homing commands
+      next if stripped.match?(/^Z/)       # Skip Z retracts
+      if stripped.match?(/^G90/)          # Skip absolute mode if already set
+        next if mode_set
+        mode_set = true
+      end
+      if stripped.match?(/^G91/)          # Skip relative mode if already set
+        next if mode_set
+        mode_set = true
+      end
+
+
+
+      # For files using the same tool, skip redundant initialization codes:
+      unless needs_header
+        # Skip common setup G-codes:
+        next if stripped.match?(/^G17/) # Skip XY plane selection
+        next if stripped.match?(/^G21/) # Skip metric units declaration
+        next if stripped.match?(/^G54/) # Skip work coordinate system selection
+
+        # Skip tool and spindle related commands:
+        next if stripped.start_with?('T')   # Tool selection commands
+        next if stripped.start_with?('S')   # Spindle speed settings
+        next if stripped.start_with?('M') && !last_file # Spindle and misc commands
+
+        # Skip Z moves in subsequent files
+        next if !index.zero? && stripped.start_with?('Z')
+      end
+
+      # Track first movement command
+      if !first_move && (stripped.start_with?('G0', 'G1', 'X', 'Y', 'Z'))
+        first_move = true
+      end
+
+      stripped, current_z = optimize_line(line, current_z, safe_height)
+      output << stripped unless stripped.empty?
+    end
+
     output
   end
 
+
   def concatenate
+    # Analyze safe height from first file
+    first_file_lines = File.readlines(@input_files[0]).map(&:rstrip)
+    safe_height = analyze_safe_heights(first_file_lines)
+
     final_output = []
     @input_files.each_with_index do |file, idx|
-      processed = process_file(file, idx)
+      processed = process_file(file, idx, safe_height)
       final_output.concat(processed)
     end
-    final_output = final_output.reject { |line| line.strip == "%" }
-    final_output.unshift(PERCENT_MARKER)
-    final_output.push(PERCENT_MARKER)
+
+    # Add program start/end markers
+    final_output.unshift('%')  # Start of program
+    final_output.push('%')     # End of program
+
     final_output
   end
 
