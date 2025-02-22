@@ -200,8 +200,6 @@ class FusionGCodeFixer
       #    is already in effect, so the line might start directly with an axis coordinate
       #    (X, Y, or Z). In such cases, we treat the line as a movement command.
       #
-      # If your G-code uses other movement commands (such as G2 or G3 for arcs),
-      # consider adding them to this condition.
       if !first_move && stripped.start_with?('G0', 'G1', 'G2', 'G3', 'X', 'Y', 'Z')
         first_move = true
       end
