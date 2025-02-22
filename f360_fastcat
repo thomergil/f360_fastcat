@@ -39,18 +39,27 @@ class FusionGCodeFixer
     end
   end
 
-  def get_tool_number(file)
-    @tool_numbers[file] ||= begin
-      tool_info = { number: nil, description: nil }
-      File.readlines(file).each do |line|
-        if line =~ /\(T(\d+)\s+([^)]+)\)/
-          tool_info[:number] = ::Regexp.last_match(1).to_i
-          tool_info[:description] = ::Regexp.last_match(2).strip
-          return tool_info
-        end
-      end
-      tool_info
+  # Extract tool number and description from the file.
+  def get_tool_by_file(file)
+    if @tool_numbers[file]
+      return @tool_numbers[file]
     end
+
+    tool_info = {
+      number: nil,
+      description: nil
+    }
+
+    File.readlines(file).each do |line|
+      if match = line.match(/\(T(\d+)\s+([^)]+)\)/)
+        tool_info[:number] = match[1].to_i
+        tool_info[:description] = match[2].strip
+        break
+      end
+    end
+
+    # implicitly returns tool_info
+    @tool_numbers[file] = tool_info
   end
 
   def analyze_safe_heights(lines)
@@ -117,23 +126,24 @@ class FusionGCodeFixer
   end
 
   def process_file(file, index, safe_height)
-    lines = File.readlines(file).map(&:rstrip)
-    current_tool = index.zero? ? nil : get_tool_number(@input_files[index - 1])
-    last_file = (index == @input_files.size - 1)
-    comment = "(BEGIN FILE: #{File.basename(file)})"
-    next_tool = get_tool_number(file)
+    lines = File.readlines(file).map(&:strip)
+    prev_file = (index == @input_files.size - 1)
 
-    # If tools are different, we need a full header G-codes
-    needs_header = index.zero? || (current_tool && next_tool && current_tool[:number] != next_tool[:number])
+    prev_tool = index.zero? ? nil : get_tool_by_file(@input_files[index - 1])
+    this_tool = get_tool_by_file(file)
+
+    # If tools are different (or this is the first file) we need a full header
+    # G-codes
+    needs_header = index.zero? || (prev_tool && this_tool && prev_tool[:number] != this_tool[:number])
 
     output = []
     output << "\n" if index.positive?
-    output << comment
+    output << "(BEGIN FILE: #{File.basename(file)})"
     current_z = nil
 
     # If tool is changing, add tool change sequence
     if needs_header && !index.zero?
-      @logger.info("Tool change detected from T#{current_tool[:number]} (#{current_tool[:description]}) to T#{next_tool[:number]} (#{next_tool[:description]})")
+      @logger.info("Tool change detected from T#{prev_tool[:number]} (#{prev_tool[:description]}) to T#{this_tool[:number]} (#{this_tool[:description]})")
       output.concat(tool_change_sequence(index, safe_height))
     elsif index.positive?
       @logger.info("No tool change detected between file #{index} and file #{index + 1}")
@@ -146,7 +156,6 @@ class FusionGCodeFixer
     end
 
     first_move = false
-    mode_set = false
 
     lines.each do |line|
       stripped = line.strip
@@ -154,41 +163,46 @@ class FusionGCodeFixer
 
       # Skip program start/end markers
       next if stripped == '%' # Program start/end marker
-      next if stripped == 'M30' && !last_file # Program end and rewind command; keep it at the end
+      next if stripped == 'M30' && !prev_file # Program end and rewind command; keep it at the end
 
       # Always skip comments
       next if stripped.start_with?('(')   # Skip all comments
-      next if stripped.match?(/^G28/)     # Skip homing commands
-      next if stripped.match?(/^Z/)       # Skip Z retracts
 
-      if stripped.match?(/^G90/)          # Skip absolute mode if already set
-        next if mode_set
+      # Skip homing commands (G28) to avoid unintended re-homing
+      # during concatenation, which could disrupt the current tool position
+      # and compromise safety.
+      next if stripped.match?(/^G28/)
 
-        mode_set = true
-      end
-      if stripped.match?(/^G91/)          # Skip relative mode if already set
-        next if mode_set
-
-        mode_set = true
-      end
+      # Skip explicit Z retract commands because safe height transitions
+      # are handled via the tool change sequence or safe retract commands.
+      # This prevents redundant or conflicting retract moves.
+      next if stripped.match?(/^Z/)
 
       # For files using the same tool, skip redundant initialization codes:
       unless needs_header
-        # Skip common setup G-codes:
-        next if stripped.match?(/^G17/) # Skip XY plane selection
-        next if stripped.match?(/^G21/) # Skip metric units declaration
-        next if stripped.match?(/^G54/) # Skip work coordinate system selection
-
-        # Skip tool and spindle related commands:
+        # Skip tool commands:
         next if stripped.start_with?('T') # Tool selection commands
-        next if stripped.start_with?('M') && !last_file && !stripped.start_with?('M3')
+
+        # For non-final files, skip redundant M commands to avoid premature or
+        # duplicate actions. We allow M3 (spindle start) because it is essential
+        # for re-engaging the spindle, while other M commands (such as M5 for
+        # spindle stop or program end commands) are omitted.
+        next if stripped.start_with?('M') && !prev_file && !stripped.start_with?('M3')
 
         # Skip Z moves in subsequent files
         next if !index.zero? && stripped.start_with?('Z')
       end
 
-      # Track first movement command
-      if !first_move && stripped.start_with?('G0', 'G1', 'X', 'Y', 'Z')
+      # Track the first movement command encountered.
+      # This check covers:
+      # 1. Explicit movement commands: G0 (rapid move) and G1 (linear interpolation).
+      # 2. Implicit movement lines: some files may omit the G-code if a modal command
+      #    is already in effect, so the line might start directly with an axis coordinate
+      #    (X, Y, or Z). In such cases, we treat the line as a movement command.
+      #
+      # If your G-code uses other movement commands (such as G2 or G3 for arcs),
+      # consider adding them to this condition.
+      if !first_move && stripped.start_with?('G0', 'G1', 'G2', 'G3', 'X', 'Y', 'Z')
         first_move = true
       end
 
@@ -201,7 +215,7 @@ class FusionGCodeFixer
 
   def concatenate
     # Analyze safe height from first file
-    first_file_lines = File.readlines(@input_files[0]).map(&:rstrip)
+    first_file_lines = File.readlines(@input_files[0]).map(&:strip)
     safe_height = analyze_safe_heights(first_file_lines)
 
     final_output = []
@@ -232,43 +246,47 @@ class FusionGCodeFixer
   end
 end
 
-options = {
-  verbose: false,
-  fast: false,
-  safe_height: nil,
-  feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD,
-  dry_run: false
-}
+def main
+  options = {
+    verbose: false,
+    fast: false,
+    safe_height: nil,
+    feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD,
+    dry_run: false
+  }
 
-opt_parser = OptionParser.new do |opts|
-  opts.banner = "Usage: #{$PROGRAM_NAME} [options] input_file1 [input_file2 ...] output_file"
-  opts.on('-v', '--verbose', 'Enable verbose mode') { options[:verbose] = true }
-  opts.on('--fast', 'Enable fast mode (optimize non-cutting moves)') { options[:fast] = true }
-  opts.on('--safe-height VALUE', Float, 'Override safe height (in mm)') { |v| options[:safe_height] = v }
-  opts.on('--feedrate-threshold VALUE', Float,
-          "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") do |v|
-    options[:feedrate_threshold] = v
+  opt_parser = OptionParser.new do |opts|
+    opts.banner = "Usage: #{$PROGRAM_NAME} [options] input_file1 [input_file2 ...] output_file"
+    opts.on('-v', '--verbose', 'Enable verbose mode') { options[:verbose] = true }
+    opts.on('--fast', 'Enable fast mode (optimize non-cutting moves)') { options[:fast] = true }
+    opts.on('--safe-height VALUE', Float, 'Override safe height (in mm)') { |v| options[:safe_height] = v }
+    opts.on('--feedrate-threshold VALUE', Float,
+            "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") do |v|
+      options[:feedrate_threshold] = v
+    end
+    opts.on('--dry-run', 'Dry run mode: display output without writing to file') { options[:dry_run] = true }
   end
-  opts.on('--dry-run', 'Dry run mode: display output without writing to file') { options[:dry_run] = true }
+
+  opt_parser.parse!
+
+  if ARGV.size < 2
+    puts opt_parser
+    exit 1
+  end
+
+  output_file = ARGV.pop
+  input_files = ARGV
+
+  fixer = FusionGCodeFixer.new(
+    input_files,
+    verbose: options[:verbose],
+    fast: options[:fast],
+    safe_height_override: options[:safe_height],
+    feedrate_threshold: options[:feedrate_threshold],
+    dry_run: options[:dry_run]
+  )
+  fixer.save_output(output_file)
+  puts "Output written to #{output_file}" unless options[:dry_run]
 end
 
-opt_parser.parse!
-
-if ARGV.size < 2
-  puts opt_parser
-  exit 1
-end
-
-output_file = ARGV.pop
-input_files = ARGV
-
-fixer = FusionGCodeFixer.new(
-  input_files,
-  verbose: options[:verbose],
-  fast: options[:fast],
-  safe_height_override: options[:safe_height],
-  feedrate_threshold: options[:feedrate_threshold],
-  dry_run: options[:dry_run]
-)
-fixer.save_output(output_file)
-puts "Output written to #{output_file}" unless options[:dry_run]
+main
