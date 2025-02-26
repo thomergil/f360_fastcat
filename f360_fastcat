@@ -185,7 +185,7 @@ module GCodeFixer
       metadata
     end
 
-    # Extract tool number and description from the file
+    # Extract tool number and description from the file.
     def get_tool_by_file(file)
       return @tool_numbers[file] if @tool_numbers.key?(file)
 
@@ -200,15 +200,19 @@ module GCodeFixer
       # Look for Fusion tool definition comments
       lines.each do |line|
         # Match Fusion 360 tool definitions like (T1 D=6.35 CR=0 - ZMIN=-10 - flat end mill)
-        if match = line.match(/\(T(\d+)\s+D=([\d.]+).*?-\s+(.+?)\)/)
-          tool_info[:number] = match[1].to_i
-          tool_info[:diameter] = match[2].to_f
-          tool_info[:description] = match[3].strip
+        match_result = line.match(/\(T(\d+)\s+D=([\d.]+).*?-\s+(.+?)\)/)
+        if match_result
+          tool_info[:number] = match_result[1].to_i
+          tool_info[:diameter] = match_result[2].to_f
+          tool_info[:description] = match_result[3].strip
           break
+        end
+
         # Simpler format like (T1 flat end mill)
-        elsif match = line.match(/\(T(\d+)\s+([^)]+)\)/)
-          tool_info[:number] = match[1].to_i
-          tool_info[:description] = match[2].strip
+        match_result = line.match(/\(T(\d+)\s+([^)]+)\)/)
+        if match_result
+          tool_info[:number] = match_result[1].to_i
+          tool_info[:description] = match_result[2].strip
           break
         end
       end
@@ -216,8 +220,9 @@ module GCodeFixer
       # Also look for explicit tool change commands
       if tool_info[:number].nil?
         lines.each do |line|
-          if match = line.match(/^T(\d+)/)
-            tool_info[:number] = match[1].to_i
+          match_result = line.match(/^T(\d+)/)
+          if match_result
+            tool_info[:number] = match_result[1].to_i
             break
           end
         end
@@ -544,7 +549,7 @@ module GCodeFixer
 
       # Sanity check: ensure we have G-code commands
       g_code_commands = output.count { |line| line =~ /\bG\d+\b/ }
-      if g_code_commands == 0
+      if g_code_commands.zero?
         raise ValidationError, 'Output does not contain any G-code commands'
       end
 
