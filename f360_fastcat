@@ -3,288 +3,785 @@
 
 require 'optparse'
 require 'logger'
+require 'yaml'
+require 'fileutils'
 
-# Constants
-DEFAULT_FEEDRATE_THRESHOLD = 0.75
-DEFAULT_SAFE_HEIGHT        = 15.0
-MIN_SAFE_HEIGHT           = 1.0
-TOOL_CHANGE_PREFIX        = '(Tool change sequence for file'
-COMMAND_STOP_SPINDLE      = 'M5'
-COMMAND_RETRACT           = 'G0 Z'
-COMMAND_HOME_Z            = 'G28 G91 Z0'
-COMMAND_ABSOLUTE_MODE     = 'G90'
+module GCodeFixer
+  # Constants
+  DEFAULT_FEEDRATE_THRESHOLD = 0.75
+  DEFAULT_SAFE_HEIGHT = 15.0
+  MIN_SAFE_HEIGHT = 1.0
+  MAX_SAFE_HEIGHT = 100.0 # Sanity check for maximum safe height
+  TOOL_CHANGE_PREFIX = '(Tool change sequence for file'
 
-class FusionGCodeFixer
-  def initialize(input_files, verbose: false, fast: false, safe_height_override: nil,
-                 feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD, dry_run: false)
-    @input_files = input_files
-    @verbose = verbose
-    @fast = fast
-    @safe_height_override = safe_height_override
-    @feedrate_threshold = feedrate_threshold
-    @dry_run = dry_run
-    @tool_numbers = {} # Cache for tool numbers
-    @logger = Logger.new($stdout)
-    @logger.level = verbose ? Logger::INFO : Logger::WARN
-    @logger.formatter = proc { |_severity, _datetime, _progname, msg| "#{msg}\n" }
+  # G-code commands
+  COMMAND_STOP_SPINDLE = 'M5'
+  COMMAND_START_SPINDLE = 'M3'
+  COMMAND_RETRACT = 'G0 Z'
+  COMMAND_HOME_Z = 'G28 G91 Z0'
+  COMMAND_ABSOLUTE_MODE = 'G90'
+  COMMAND_RELATIVE_MODE = 'G91'
+  COMMAND_RAPID_MOVE = 'G0'
+  COMMAND_LINEAR_MOVE = 'G1'
+  COMMAND_PROGRAM_END = 'M30'
 
-    validate_files
-  end
+  # File formats and patterns
+  PROGRAM_MARKER = '%'
+  COMMENT_START = '('
+  COMMENT_END = ')'
 
-  def validate_files
-    @input_files.each do |file|
-      unless File.readable?(file)
-        raise ArgumentError, "Cannot read file: #{file}"
-      end
-    end
-  end
-
-  # Extract tool number and description from the file.
-  def get_tool_by_file(file)
-    if @tool_numbers[file]
-      return @tool_numbers[file]
-    end
-
-    tool_info = {
-      number: nil,
-      description: nil
+  # Known CNC machine profiles
+  MACHINE_PROFILES = {
+    'generic' => {
+      max_feedrate: 5000,
+      safe_height: 15.0,
+      rapid_feedrate: 3000
+    },
+    'shapeoko' => {
+      max_feedrate: 4000,
+      safe_height: 20.0,
+      rapid_feedrate: 3000
+    },
+    'xcarve' => {
+      max_feedrate: 3000,
+      safe_height: 25.0,
+      rapid_feedrate: 2000
+    },
+    'nomad3' => {
+      max_feedrate: 2500,
+      safe_height: 12.0,
+      rapid_feedrate: 2500
     }
+  }.freeze
 
-    File.readlines(file).each do |line|
-      if match = line.match(/\(T(\d+)\s+([^)]+)\)/)
-        tool_info[:number] = match[1].to_i
-        tool_info[:description] = match[2].strip
-        break
+  # Error classes for better exception handling
+  class GCodeError < StandardError; end
+  class FileError < GCodeError; end
+  class ValidationError < GCodeError; end
+  class SafetyError < GCodeError; end
+
+  # Main class for G-code processing
+  class FusionGCodeFixer
+    attr_reader :logger
+
+    def initialize(input_files, options = {})
+      @input_files = input_files
+      @verbose = options[:verbose] || false
+      @fast = options[:fast] || false
+      @safe_height_override = options[:safe_height]
+      @feedrate_threshold = options[:feedrate_threshold] || DEFAULT_FEEDRATE_THRESHOLD
+      @dry_run = options[:dry_run] || false
+      @machine_profile = options[:machine_profile] || 'generic'
+      @output_dir = options[:output_dir] || '.'
+      @backup = options[:backup] || false
+
+      # Initialize caches
+      @tool_numbers = {}
+      @file_contents = {}
+      @file_metadata = {}
+
+      # Set up logging
+      setup_logger(options[:log_file])
+
+      # Load machine profile
+      load_machine_profile
+
+      # Validate input files
+      validate_files
+    end
+
+    # Set up logger with appropriate level and format
+    def setup_logger(log_file = nil)
+      @logger = Logger.new(log_file || $stdout)
+      @logger.level = @verbose ? Logger::INFO : Logger::WARN
+      @logger.formatter = proc { |_severity, _datetime, _progname, msg| "#{msg}\n" }
+    end
+
+    # Load machine profile settings
+    def load_machine_profile
+      unless MACHINE_PROFILES.key?(@machine_profile)
+        @logger.warn("Unknown machine profile: #{@machine_profile}, falling back to generic")
+        @machine_profile = 'generic'
+      end
+
+      profile = MACHINE_PROFILES[@machine_profile]
+      @max_feedrate = profile[:max_feedrate]
+      @default_safe_height = profile[:safe_height]
+      @rapid_feedrate = profile[:rapid_feedrate]
+
+      @logger.info("Loaded machine profile: #{@machine_profile}")
+      @logger.info("  - Max feedrate: #{@max_feedrate}")
+      @logger.info("  - Default safe height: #{@default_safe_height}")
+      @logger.info("  - Rapid feedrate: #{@rapid_feedrate}")
+    end
+
+    # Validate that all input files exist and are readable
+    def validate_files
+      @logger.info("Validating #{@input_files.size} input files")
+
+      missing_files = @input_files.reject { |file| File.exist?(file) }
+      if missing_files.any?
+        raise FileError, "The following files do not exist: #{missing_files.join(', ')}"
+      end
+
+      unreadable_files = @input_files.reject { |file| File.readable?(file) }
+      if unreadable_files.any?
+        raise FileError, "Cannot read the following files: #{unreadable_files.join(', ')}"
+      end
+
+      # Check if any files are empty
+      empty_files = @input_files.select { |file| File.size(file).zero? }
+      if empty_files.any?
+        raise FileError, "The following files are empty: #{empty_files.join(', ')}"
+      end
+
+      @logger.info('All input files validated successfully')
+    end
+
+    # Read file contents with caching
+    def read_file(file)
+      return @file_contents[file] if @file_contents.key?(file)
+
+      begin
+        content = File.readlines(file).map(&:strip)
+        @file_contents[file] = content
+        @logger.info("Read #{content.size} lines from #{file}")
+        content
+      rescue StandardError => e
+        @logger.error("Failed to read file #{file}: #{e.message}")
+        raise FileError, "Failed to read file #{file}: #{e.message}"
       end
     end
 
-    # implicitly returns tool_info
-    @tool_numbers[file] = tool_info
-  end
+    # Extract metadata from a G-code file
+    def extract_file_metadata(file)
+      return @file_metadata[file] if @file_metadata.key?(file)
 
-  def analyze_safe_heights(lines)
-    if @safe_height_override
-      @logger.info("Using user-specified safe height: #{@safe_height_override}mm")
-      return @safe_height_override
-    end
+      lines = read_file(file)
+      metadata = {
+        tool_info: get_tool_by_file(file),
+        has_tool_changes: lines.any? { |line| line.match?(/T\d+/) },
+        movement_commands: lines.count { |line| line.match?(/\b(G0|G1|G2|G3)\b/) },
+        spindle_commands: lines.count { |line| line.match?(/\b(M3|M4|M5)\b/) },
+        max_feedrate: 0,
+        axis_used: {
+          x: lines.any? { |line| line.match?(/\bX[-\d.]+/) },
+          y: lines.any? { |line| line.match?(/\bY[-\d.]+/) },
+          z: lines.any? { |line| line.match?(/\bZ[-\d.]+/) }
+        }
+      }
 
-    potential_heights = []
-    current_z = nil
-    last_feedrate = nil
-
-    lines.each do |line|
-      if line =~ /\bZ([-\d.]+)/
-        new_z = ::Regexp.last_match(1).to_f
-        feedrate = nil
-        feedrate = ::Regexp.last_match(1).to_f if line =~ /F([\d.]+)/
-        if feedrate && last_feedrate && (feedrate < last_feedrate * @feedrate_threshold && current_z)
-          potential_heights << current_z
+      # Extract max feedrate
+      lines.each do |line|
+        if line =~ /F([\d.]+)/
+          feedrate = ::Regexp.last_match(1).to_f
+          metadata[:max_feedrate] = feedrate if feedrate > metadata[:max_feedrate]
         end
-        current_z = new_z
-        last_feedrate = feedrate if feedrate
       end
+
+      @file_metadata[file] = metadata
+      @logger.info("Extracted metadata for #{file}")
+
+      metadata
     end
 
-    potential_heights.reject! { |h| h < MIN_SAFE_HEIGHT }
-    height = potential_heights.max
-    unless height
-      @logger.warn("No valid Z moves found, defaulting to #{DEFAULT_SAFE_HEIGHT}mm")
-      height = DEFAULT_SAFE_HEIGHT
+    # Extract tool number and description from the file
+    def get_tool_by_file(file)
+      return @tool_numbers[file] if @tool_numbers.key?(file)
+
+      tool_info = {
+        number: nil,
+        description: nil,
+        diameter: nil
+      }
+
+      lines = read_file(file)
+
+      # Look for Fusion tool definition comments
+      lines.each do |line|
+        # Match Fusion 360 tool definitions like (T1 D=6.35 CR=0 - ZMIN=-10 - flat end mill)
+        if match = line.match(/\(T(\d+)\s+D=([\d.]+).*?-\s+(.+?)\)/)
+          tool_info[:number] = match[1].to_i
+          tool_info[:diameter] = match[2].to_f
+          tool_info[:description] = match[3].strip
+          break
+        # Simpler format like (T1 flat end mill)
+        elsif match = line.match(/\(T(\d+)\s+([^)]+)\)/)
+          tool_info[:number] = match[1].to_i
+          tool_info[:description] = match[2].strip
+          break
+        end
+      end
+
+      # Also look for explicit tool change commands
+      if tool_info[:number].nil?
+        lines.each do |line|
+          if match = line.match(/^T(\d+)/)
+            tool_info[:number] = match[1].to_i
+            break
+          end
+        end
+      end
+
+      @tool_numbers[file] = tool_info
+      @logger.info("Found tool #{tool_info[:number]} (#{tool_info[:description]}) in #{file}")
+
+      tool_info
     end
 
-    @logger.info("Found safe height: #{height}mm")
-    height
-  end
+    # Analyze safe heights using multiple methods for robustness
+    def analyze_safe_heights(file)
+      # Use override if provided
+      if @safe_height_override
+        @logger.info("Using user-specified safe height: #{@safe_height_override}mm")
+        return validate_safe_height(@safe_height_override)
+      end
 
-  def optimize_line(line, current_z, safe_height)
-    stripped = line.strip
-    return [stripped, current_z] if stripped.empty? || stripped.start_with?('(')
+      lines = read_file(file)
 
-    if stripped =~ /\bZ([-\d.]+)/
-      current_z = ::Regexp.last_match(1).to_f
+      # Method 1: Feedrate change detection
+      heights_by_feedrate = detect_heights_by_feedrate(lines)
+
+      # Method 2: Find highest Z move
+      heights_by_max_z = detect_heights_by_max_z(lines)
+
+      # Method 3: Look for explicit retract commands
+      heights_by_retract = detect_heights_by_retract_commands(lines)
+
+      # Combine methods with weights
+      all_heights = []
+      all_heights.concat(heights_by_feedrate)
+      all_heights.concat(heights_by_max_z)
+      all_heights.concat(heights_by_retract)
+
+      # Filter and get a reasonable height
+      valid_heights = all_heights.reject { |h| h < MIN_SAFE_HEIGHT || h > MAX_SAFE_HEIGHT }
+
+      if valid_heights.empty?
+        @logger.warn("No valid safe heights detected, using default: #{@default_safe_height}mm")
+        return @default_safe_height
+      end
+
+      # Use 75th percentile height for robustness against outliers
+      sorted_heights = valid_heights.sort
+      percentile_idx = (sorted_heights.size * 0.75).floor
+      safe_height = sorted_heights[percentile_idx]
+
+      # Round up to nearest mm for extra safety
+      safe_height = safe_height.ceil
+
+      @logger.info("Detected safe height: #{safe_height}mm (from #{valid_heights.size} candidates)")
+      safe_height
     end
 
-    if stripped =~ (/\b(G0|G1)\b/) && (@fast && current_z && current_z >= safe_height)
-      stripped = stripped.gsub(/G1/, 'G0').gsub(/F[\d.]+/, '')
-      stripped = stripped.squeeze(' ').strip
+    # Method 1: Detect safe heights based on feedrate changes
+    def detect_heights_by_feedrate(lines)
+      potential_heights = []
+      current_z = nil
+      last_feedrate = nil
+
+      lines.each do |line|
+        # Skip comments and empty lines
+        next if line.strip.empty? || line.start_with?(COMMENT_START)
+
+        if line =~ /\bZ([-\d.]+)/
+          new_z = ::Regexp.last_match(1).to_f
+
+          feedrate = nil
+          feedrate = ::Regexp.last_match(1).to_f if line =~ /F([\d.]+)/
+
+          # If feedrate drops significantly, current Z might be a safe height
+          if feedrate && last_feedrate &&
+             (feedrate < last_feedrate * @feedrate_threshold) &&
+             current_z && current_z > MIN_SAFE_HEIGHT
+            potential_heights << current_z
+          end
+
+          current_z = new_z
+          last_feedrate = feedrate if feedrate
+        end
+      end
+
+      @logger.info("Found #{potential_heights.size} potential safe heights by feedrate method")
+      potential_heights
     end
 
-    [stripped, current_z]
-  end
+    # Method 2: Find highest Z moves as potential safe heights
+    def detect_heights_by_max_z(lines)
+      z_heights = []
 
-  def tool_change_sequence(file_number, safe_height)
-    [
-      '',
-      "#{TOOL_CHANGE_PREFIX} #{file_number + 1})",
-      COMMAND_STOP_SPINDLE,
-      'M0 (Pause for tool change)',
-      "#{COMMAND_RETRACT}#{safe_height}",
-      COMMAND_HOME_Z,
-      COMMAND_ABSOLUTE_MODE,
-      ''
-    ]
-  end
+      lines.each do |line|
+        # Look for Z moves in rapid (G0) commands
+        if line.match?(/\bG0\b/) && line =~ /\bZ([-\d.]+)/
+          z_value = ::Regexp.last_match(1).to_f
+          z_heights << z_value if z_value > MIN_SAFE_HEIGHT
+        end
+      end
 
-  def process_file(file, index, safe_height)
-    lines = File.readlines(file).map(&:strip)
-    prev_file = (index == @input_files.size - 1)
+      # Get the top 25% of Z heights
+      sorted_z = z_heights.sort
+      top_quarter_start = (sorted_z.size * 0.75).floor
+      top_quarter = sorted_z[top_quarter_start..-1] || []
 
-    prev_tool = index.zero? ? nil : get_tool_by_file(@input_files[index - 1])
-    this_tool = get_tool_by_file(file)
-
-    # If tools are different (or this is the first file) we need a full header
-    # G-codes
-    needs_header = index.zero? || (prev_tool && this_tool && prev_tool[:number] != this_tool[:number])
-
-    output = []
-    output << "\n" if index.positive?
-    output << "(BEGIN FILE: #{File.basename(file)})"
-    current_z = nil
-
-    # If tool is changing, add tool change sequence
-    if needs_header && !index.zero?
-      @logger.info("Tool change detected from T#{prev_tool[:number]} (#{prev_tool[:description]}) to T#{this_tool[:number]} (#{this_tool[:description]})")
-      output.concat(tool_change_sequence(index, safe_height))
-    elsif index.positive?
-      @logger.info("No tool change detected between file #{index} and file #{index + 1}")
-      # For same tool transitions, add a safe retract
-      output.concat([
-                      '(Safe retract)',
-                      "G0 Z#{safe_height}", # Safe retract
-                      ''
-                    ])
+      @logger.info("Found #{top_quarter.size} potential safe heights by max Z method")
+      top_quarter
     end
 
-    first_move = false
+    # Method 3: Look for explicit retract commands
+    def detect_heights_by_retract_commands(lines)
+      retract_heights = []
 
-    lines.each do |line|
+      lines.each do |line|
+        # Look for explicit retract comments or commands
+        if (line.include?('retract') || line.include?('clearance')) &&
+           line =~ /\bZ([-\d.]+)/
+          z_value = ::Regexp.last_match(1).to_f
+          retract_heights << z_value if z_value > MIN_SAFE_HEIGHT
+        end
+      end
+
+      @logger.info("Found #{retract_heights.size} potential safe heights by retract command method")
+      retract_heights
+    end
+
+    # Validate that a safe height is reasonable
+    def validate_safe_height(height)
+      if height < MIN_SAFE_HEIGHT
+        @logger.warn("Safe height #{height}mm is below minimum of #{MIN_SAFE_HEIGHT}mm, using minimum")
+        return MIN_SAFE_HEIGHT
+      elsif height > MAX_SAFE_HEIGHT
+        @logger.warn("Safe height #{height}mm exceeds maximum of #{MAX_SAFE_HEIGHT}mm, using maximum")
+        return MAX_SAFE_HEIGHT
+      end
+
+      height
+    end
+
+    # Optimize a G-code line for performance
+    def optimize_line(line, current_z, safe_height)
       stripped = line.strip
-      next if stripped.empty?
+      return [stripped, current_z] if stripped.empty? || stripped.start_with?(COMMENT_START)
 
-      # Skip program start/end markers
-      next if stripped == '%' # Program start/end marker
-      next if stripped == 'M30' && !prev_file # Program end and rewind command; keep it at the end
-
-      # Always skip comments
-      next if stripped.start_with?('(')   # Skip all comments
-
-      # Skip homing commands (G28) to avoid unintended re-homing
-      # during concatenation, which could disrupt the current tool position
-      # and compromise safety.
-      next if stripped.match?(/^G28/)
-
-      # Skip explicit Z retract commands because safe height transitions
-      # are handled via the tool change sequence or safe retract commands.
-      # This prevents redundant or conflicting retract moves.
-      next if stripped.match?(/^Z/)
-
-      # For files using the same tool, skip redundant initialization codes:
-      unless needs_header
-        # Skip tool commands:
-        next if stripped.start_with?('T') # Tool selection commands
-
-        # For non-final files, skip redundant M commands to avoid premature or
-        # duplicate actions. We allow M3 (spindle start) because it is essential
-        # for re-engaging the spindle, while other M commands (such as M5 for
-        # spindle stop or program end commands) are omitted.
-        next if stripped.start_with?('M') && !prev_file && !stripped.start_with?('M3')
-
-        # Skip Z moves in subsequent files
-        next if !index.zero? && stripped.start_with?('Z')
+      # Track current Z position
+      if stripped =~ /\bZ([-\d.]+)/
+        current_z = ::Regexp.last_match(1).to_f
       end
 
-      # Track the first movement command encountered.
-      # This check covers:
-      # 1. Explicit movement commands: G0 (rapid move) and G1 (linear interpolation).
-      # 2. Implicit movement lines: some files may omit the G-code if a modal command
-      #    is already in effect, so the line might start directly with an axis coordinate
-      #    (X, Y, or Z). In such cases, we treat the line as a movement command.
-      #
-      if !first_move && stripped.start_with?('G0', 'G1', 'G2', 'G3', 'X', 'Y', 'Z')
-        first_move = true
+      # Convert G1 to G0 for rapid moves above safe height
+      if @fast && stripped =~ /\b(G0|G1)\b/ && current_z && current_z >= safe_height
+        # Only change to G0 if we're above safe height
+        stripped = stripped.gsub(/G1/, 'G0')
+
+        # Remove feedrate for G0 moves (they're already max speed)
+        stripped = stripped.gsub(/F[\d.]+/, '')
+
+        # Clean up the line
+        stripped = stripped.squeeze(' ').strip
       end
 
-      stripped, current_z = optimize_line(line, current_z, safe_height)
-      output << stripped unless stripped.empty?
+      # Add rapid feedrate to G0 moves that have a feedrate specified
+      if stripped.start_with?('G0') && stripped =~ /F[\d.]+/
+        stripped = stripped.gsub(/F[\d.]+/, "F#{@rapid_feedrate}")
+      end
+
+      [stripped, current_z]
     end
 
-    output
+    # Generate tool change sequence
+    def tool_change_sequence(file_number, safe_height, from_tool, to_tool)
+      sequence = [
+        '',
+        "#{TOOL_CHANGE_PREFIX} #{file_number + 1})",
+        COMMAND_STOP_SPINDLE,
+        "#{COMMAND_RETRACT}#{safe_height}",
+        COMMAND_HOME_Z
+      ]
+
+      # Add tool information if available
+      if from_tool && from_tool[:number] && to_tool && to_tool[:number]
+        sequence << "(Changing from T#{from_tool[:number]} [#{from_tool[:description]}] to T#{to_tool[:number]} [#{to_tool[:description]}])"
+      end
+
+      # Add command to pause for manual tool change
+      sequence << "M0 (Pause for tool change to T#{to_tool[:number]})"
+
+      # Add finishing commands
+      sequence.concat([
+                        COMMAND_ABSOLUTE_MODE,
+                        ''
+                      ])
+
+      sequence
+    end
+
+    # Process a single G-code file
+    def process_file(file, index, safe_height)
+      @logger.info("Processing file #{index + 1}/#{@input_files.size}: #{file}")
+
+      lines = read_file(file)
+      is_last_file = (index == @input_files.size - 1)
+
+      prev_tool = index.zero? ? nil : get_tool_by_file(@input_files[index - 1])
+      this_tool = get_tool_by_file(file)
+
+      # Check if we need a full header (first file or tool change)
+      needs_header = index.zero? || (prev_tool && this_tool &&
+                                     prev_tool[:number] && this_tool[:number] &&
+                                     prev_tool[:number] != this_tool[:number])
+
+      output = []
+      output << "\n" if index.positive?
+      output << "(BEGIN FILE: #{File.basename(file)})"
+
+      # Add file metadata if we have it
+      if this_tool[:number] || this_tool[:description]
+        output << "(Tool: T#{this_tool[:number] || '?'} - #{this_tool[:description] || 'Unknown'})"
+      end
+
+      current_z = nil
+
+      # Handle tool changes between files
+      if needs_header && !index.zero?
+        @logger.info("Tool change detected from T#{prev_tool[:number]} to T#{this_tool[:number]}")
+        output.concat(tool_change_sequence(index, safe_height, prev_tool, this_tool))
+      elsif index.positive?
+        @logger.info("No tool change between files #{index} and #{index + 1}")
+        # For same tool transitions, add a safe retract
+        output.concat([
+                        '(Safe retract between operations)',
+                        "#{COMMAND_RETRACT}#{safe_height}", # Safe retract
+                        ''
+                      ])
+      end
+
+      first_move = false
+      spindle_state = false # Track spindle state
+
+      lines.each do |line|
+        stripped = line.strip
+        next if stripped.empty?
+
+        # Skip program start/end markers
+        next if stripped == PROGRAM_MARKER
+        next if stripped == COMMAND_PROGRAM_END && !is_last_file
+
+        # Always keep comments in the first file or with tool changes
+        if stripped.start_with?(COMMENT_START)
+          output << stripped if index.zero? || needs_header
+          next
+        end
+
+        # Skip homing commands (G28) except in the first file
+        next if !index.zero? && stripped.match?(/^G28/)
+
+        # Skip explicit Z retract commands in non-first files
+        next if !index.zero? && stripped.match?(/^Z[\d.]+/)
+
+        # For files using the same tool, skip redundant commands
+        unless needs_header
+          # Skip tool selection commands
+          next if stripped.start_with?('T')
+
+          # For non-final files, skip redundant M commands
+          if stripped.start_with?('M')
+            # Track spindle state
+            spindle_state = true if stripped.start_with?('M3') || stripped.start_with?('M4')
+            spindle_state = false if stripped.start_with?('M5')
+
+            # Skip all M commands except spindle start
+            next if !is_last_file && !stripped.start_with?('M3') && !stripped.start_with?('M4')
+          end
+        end
+
+        # Track movement commands
+        if !first_move && stripped.match?(/^(G0|G1|G2|G3|X|Y|Z)/)
+          first_move = true
+        end
+
+        # Optimize the line
+        stripped, current_z = optimize_line(stripped, current_z, safe_height)
+        output << stripped unless stripped.empty?
+      end
+
+      # Ensure spindle is turned off at the end of the last file
+      if is_last_file && spindle_state
+        output << COMMAND_STOP_SPINDLE
+      end
+
+      output
+    end
+
+    # Concatenate all input files
+    def concatenate
+      @logger.info('Beginning file concatenation')
+
+      # Analyze safe height from first file for consistency
+      safe_height = analyze_safe_heights(@input_files[0])
+      @logger.info("Using safe height of #{safe_height}mm for all operations")
+
+      # Process each file
+      final_output = []
+      @input_files.each_with_index do |file, idx|
+        @logger.info("Processing file #{idx + 1}/#{@input_files.size}: #{file}")
+        processed = process_file(file, idx, safe_height)
+        final_output.concat(processed)
+      end
+
+      # Add program start/end markers
+      final_output.unshift(PROGRAM_MARKER) # Start of program
+      final_output.push(COMMAND_PROGRAM_END) # Program end
+      final_output.push(PROGRAM_MARKER) # End of program
+
+      # Validate the output
+      validate_output(final_output)
+
+      final_output
+    end
+
+    # Validate the concatenated output for safety and correctness
+    def validate_output(output)
+      @logger.info('Validating output G-code')
+
+      # Sanity check: ensure we have G-code commands
+      g_code_commands = output.count { |line| line =~ /\bG\d+\b/ }
+      if g_code_commands == 0
+        raise ValidationError, 'Output does not contain any G-code commands'
+      end
+
+      # Check for unbalanced comments
+      open_comments = 0
+      output.each do |line|
+        open_count = line.count('(')
+        close_count = line.count(')')
+        open_comments += (open_count - close_count)
+      end
+
+      if open_comments != 0
+        @logger.warn("Unbalanced comments detected in output (#{open_comments})")
+      end
+
+      # Check for program start/end markers
+      unless output.first == PROGRAM_MARKER
+        @logger.warn('Output does not start with program marker')
+      end
+
+      unless output.last == PROGRAM_MARKER
+        @logger.warn('Output does not end with program marker')
+      end
+
+      # Check for excessive feedrates
+      max_feedrate = 0
+      output.each do |line|
+        if line =~ /F([\d.]+)/
+          feedrate = ::Regexp.last_match(1).to_f
+          max_feedrate = feedrate if feedrate > max_feedrate
+        end
+      end
+
+      if max_feedrate > @max_feedrate
+        @logger.warn("Output contains feedrate (#{max_feedrate}) exceeding machine maximum (#{@max_feedrate})")
+      end
+
+      @logger.info("Output validation complete: #{output.size} lines, #{g_code_commands} G-code commands")
+    end
+
+    # Save the concatenated output to a file
+    def save_output(output_file)
+      final_output = concatenate
+
+      if final_output.empty?
+        raise ValidationError, 'No output generated'
+      end
+
+      if @dry_run
+        @logger.info("Dry run mode enabled. Output would be written to: #{output_file}")
+        puts final_output.join("\n")
+        return
+      end
+
+      # Create output directory if it doesn't exist
+      output_dir = File.dirname(output_file)
+      unless File.directory?(output_dir)
+        @logger.info("Creating output directory: #{output_dir}")
+        FileUtils.mkdir_p(output_dir)
+      end
+
+      # Create backup if requested
+      if @backup && File.exist?(output_file)
+        backup_file = "#{output_file}.bak.#{Time.now.strftime('%Y%m%d%H%M%S')}"
+        @logger.info("Creating backup: #{backup_file}")
+        FileUtils.cp(output_file, backup_file)
+      end
+
+      # Write the output file
+      begin
+        File.write(output_file, final_output.join("\n"))
+        @logger.info("Successfully wrote #{final_output.size} lines to #{output_file}")
+      rescue StandardError => e
+        @logger.error("Failed to write output file: #{e.message}")
+        raise FileError, "Failed to write output file: #{e.message}"
+      end
+
+      # Write summary file
+      if @verbose
+        summary_file = "#{output_file}.summary.txt"
+        write_summary(summary_file, final_output)
+      end
+    end
+
+    # Write a summary file with statistics
+    def write_summary(summary_file, output)
+      summary = [
+        'G-Code Concatenation Summary',
+        "Generated on #{Time.now}",
+        '',
+        'Input Files:',
+        @input_files.map.with_index { |f, i| "  #{i + 1}. #{f}" }.join("\n"),
+        '',
+        'Statistics:',
+        "  Total lines: #{output.size}",
+        "  G-code commands: #{output.count { |line| line =~ /\bG\d+\b/ }}",
+        "  M-code commands: #{output.count { |line| line =~ /\bM\d+\b/ }}",
+        "  Comments: #{output.count { |line| line.start_with?(COMMENT_START) }}",
+        "  Tool changes: #{output.count { |line| line.include?('Tool change sequence') }}",
+        '',
+        'Tools used:',
+        @tool_numbers.map do |file, tool|
+          "  #{File.basename(file)}: T#{tool[:number] || '?'} - #{tool[:description] || 'Unknown'}"
+        end.join("\n")
+      ].join("\n")
+
+      File.write(summary_file, summary)
+      @logger.info("Wrote summary to #{summary_file}")
+    rescue StandardError => e
+      @logger.warn("Failed to write summary file: #{e.message}")
+    end
   end
 
-  def concatenate
-    # Analyze safe height from first file
-    first_file_lines = File.readlines(@input_files[0]).map(&:strip)
-    safe_height = analyze_safe_heights(first_file_lines)
-
-    final_output = []
-    @input_files.each_with_index do |file, idx|
-      processed = process_file(file, idx, safe_height)
-      final_output.concat(processed)
+  # Command line interface
+  class CLI
+    def initialize
+      @options = {
+        verbose: false,
+        fast: false,
+        safe_height: nil,
+        feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD,
+        dry_run: false,
+        machine_profile: 'generic',
+        output_dir: nil,
+        backup: true
+      }
     end
 
-    # Add program start/end markers
-    final_output.unshift('%')  # Start of program
-    final_output.push('%')     # End of program
+    def parse_options
+      opt_parser = OptionParser.new do |opts|
+        opts.banner = "Usage: #{$PROGRAM_NAME} [options] input_file1 [input_file2 ...] output_file"
 
-    final_output
-  end
+        opts.separator ''
+        opts.separator 'Basic options:'
 
-  def save_output(output_file)
-    final_output = concatenate
-    if final_output.empty? || final_output.none? { |line| line =~ /\bG\d+\b/ }
-      raise 'Sanity check failed: Output does not contain any G-code commands.'
+        opts.on('-v', '--verbose', 'Enable verbose mode') do
+          @options[:verbose] = true
+        end
+
+        opts.on('--fast', 'Enable fast mode (optimize non-cutting moves)') do
+          @options[:fast] = true
+        end
+
+        opts.on('--safe-height VALUE', Float, 'Override safe height (in mm)') do |v|
+          @options[:safe_height] = v
+        end
+
+        opts.on('--feedrate-threshold VALUE', Float,
+                "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") do |v|
+          @options[:feedrate_threshold] = v
+        end
+
+        opts.on('--dry-run', 'Dry run mode: display output without writing to file') do
+          @options[:dry_run] = true
+        end
+
+        opts.separator ''
+        opts.separator 'Advanced options:'
+
+        opts.on('--machine PROFILE', "Use a specific machine profile (#{MACHINE_PROFILES.keys.join(', ')})") do |v|
+          @options[:machine_profile] = v
+        end
+
+        opts.on('--output-dir DIR', 'Set output directory') do |v|
+          @options[:output_dir] = v
+        end
+
+        opts.on('--[no-]backup', 'Create backup of existing output files (default: true)') do |v|
+          @options[:backup] = v
+        end
+
+        opts.on('--log-file FILE', 'Write log to file instead of stdout') do |v|
+          @options[:log_file] = v
+        end
+
+        opts.on_tail('-h', '--help', 'Show this help message') do
+          puts opts
+          exit
+        end
+
+        opts.on_tail('--version', 'Show version') do
+          puts 'Fusion GCode Fixer v2.0.0'
+          exit
+        end
+      end
+
+      begin
+        opt_parser.parse!
+
+        if ARGV.size < 2
+          puts opt_parser
+          exit 1
+        end
+
+        @output_file = ARGV.pop
+        @input_files = ARGV
+
+        # If output directory is specified, adjust output file path
+        if @options[:output_dir]
+          @output_file = File.join(@options[:output_dir], File.basename(@output_file))
+        end
+      rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+        puts "Error: #{e.message}"
+        puts opt_parser
+        exit 1
+      end
     end
 
-    if @dry_run
-      @logger.info('Dry run mode enabled. The following output would be written:')
-      puts final_output.join("\n")
-    else
-      File.write(output_file, final_output.join("\n"))
+    def run
+      parse_options
+
+      fixer = FusionGCodeFixer.new(
+        @input_files,
+        @options
+      )
+
+      fixer.save_output(@output_file)
+
+      unless @options[:dry_run]
+        puts "Output written to #{@output_file}"
+      end
+
+      0
+    rescue StandardError => e
+      puts "Error: #{e.message}"
+
+      # Print backtrace in verbose mode
+      if @options[:verbose]
+        puts e.backtrace
+      end
+
+      1
     end
   end
 end
 
-def main
-  options = {
-    verbose: false,
-    fast: false,
-    safe_height: nil,
-    feedrate_threshold: DEFAULT_FEEDRATE_THRESHOLD,
-    dry_run: false
-  }
-
-  opt_parser = OptionParser.new do |opts|
-    opts.banner = "Usage: #{$PROGRAM_NAME} [options] input_file1 [input_file2 ...] output_file"
-    opts.on('-v', '--verbose', 'Enable verbose mode') { options[:verbose] = true }
-    opts.on('--fast', 'Enable fast mode (optimize non-cutting moves)') { options[:fast] = true }
-    opts.on('--safe-height VALUE', Float, 'Override safe height (in mm)') { |v| options[:safe_height] = v }
-    opts.on('--feedrate-threshold VALUE', Float,
-            "Set feedrate drop threshold (default: #{DEFAULT_FEEDRATE_THRESHOLD})") do |v|
-      options[:feedrate_threshold] = v
-    end
-    opts.on('--dry-run', 'Dry run mode: display output without writing to file') { options[:dry_run] = true }
-  end
-
-  opt_parser.parse!
-
-  if ARGV.size < 2
-    puts opt_parser
-    exit 1
-  end
-
-  output_file = ARGV.pop
-  input_files = ARGV
-
-  fixer = FusionGCodeFixer.new(
-    input_files,
-    verbose: options[:verbose],
-    fast: options[:fast],
-    safe_height_override: options[:safe_height],
-    feedrate_threshold: options[:feedrate_threshold],
-    dry_run: options[:dry_run]
-  )
-  fixer.save_output(output_file)
-  puts "Output written to #{output_file}" unless options[:dry_run]
+# Run the program if this script is executed directly
+if __FILE__ == $PROGRAM_NAME
+  exit GCodeFixer::CLI.new.run
 end
-
-main
