@@ -8,7 +8,7 @@ Fusion 360's post processors generate separate G-code files for each operation. 
 
 - Maintaining safe Z heights between operations
 - Properly sequencing tool changes
-- Optimizing rapid moves for faster execution
+- Optimizing travel moves with appropriate feed rates
 - Removing redundant commands
 
 ## ⚠️ Warning / Disclaimer
@@ -20,9 +20,9 @@ This software is provided "as-is" without any warranties. Use at your own risk. 
 ## Features
 
 - **Intelligent Safe Height Detection**:
-  - Multiple detection methods for reliable safety heights
+  - Analyzes maximum Z heights across all files for reliable safety heights
   - User-configurable overrides
-  - Validation against machine-specific limits
+  - Minimum safe height enforcement
 
 - **Tool Change Management**:
   - Automatic detection of tool changes between files
@@ -30,24 +30,19 @@ This software is provided "as-is" without any warranties. Use at your own risk. 
   - Clear operator instructions for manual tool changes
 
 - **Performance Optimization**:
-  - Conversion of cutting moves (G1) to rapid moves (G0) when appropriate
+  - Travel feed rate optimization for non-cutting moves
+  - Sets appropriate feed rates based on Z position
   - Removal of redundant commands between operations
-  - Feedrate optimization for non-cutting moves
 
-- **Machine Profiles**:
-  - Predefined settings for common CNC machines
-  - Customizable parameters for specific machine capabilities
-  - Safety limits enforcement based on machine specifications
+- **Feed Rate Management**:
+  - Automatically detects when tool is in travel motion
+  - Applies optimized feed rates for travel moves
+  - Restores previous feed rate when returning to cutting
 
 - **Robust Error Handling**:
   - Comprehensive validation of input files
   - Detailed error reporting
   - Validation of output G-code for safety
-
-- **Backup and Logging**:
-  - Automatic backup of existing output files
-  - Configurable logging levels
-  - Optional summary reports
 
 ## Limitations
 
@@ -71,65 +66,34 @@ This software is provided "as-is" without any warranties. Use at your own risk. 
 f360_fastcat [options] input_file1 [input_file2 ...] output_file
 ```
 
-### Basic Options
+### Options
 
 - `-v, --verbose`: Enable verbose output
-- `--fast`: Enable rapid move optimizations
+- `--fast`: Enable feed rate optimization for non-cutting moves
 - `--safe-height VALUE`: Override the detected safe height (in mm)
-- `--feedrate-threshold VALUE`: Adjust the feedrate drop threshold (default: 0.75)
+- `--travel-feedrate VALUE`: Set feed rate for travel moves (mm/min)
 - `--dry-run`: Print the final G-code to the terminal without writing to a file
-
-### Advanced Options
-
-- `--machine PROFILE`: Use a specific machine profile (optional, defaults to 'generic')
-  - Available profiles: generic, shapeoko, xcarve, nomad3
-- `--output-dir DIR`: Set output directory
-- `--[no-]backup`: Create backup of existing output files (default: true)
-- `--log-file FILE`: Write log to file instead of stdout
-- `-h, --help`: Show help message
-- `--version`: Show version
-
-## Machine Profiles
-
-The utility includes predefined profiles for common CNC machines. **If no profile is specified, the 'generic' profile is used by default.**
-
-| Profile | Max Feedrate | Safe Height | Rapid Feedrate | Description |
-|---------|-------------|------------|---------------|-------------|
-| generic | 5000 mm/min | 15.0 mm    | 3000 mm/min   | Default conservative settings |
-| shapeoko | 4000 mm/min | 20.0 mm   | 3000 mm/min   | Optimized for Shapeoko CNC machines |
-| xcarve | 3000 mm/min  | 25.0 mm    | 2000 mm/min   | Optimized for X-Carve CNC machines |
-| nomad3 | 2500 mm/min  | 12.0 mm    | 2500 mm/min   | Optimized for Nomad 3 CNC machines |
-
-The machine profile affects:
-- Safe height defaults when automatic detection fails
-- Maximum allowed feedrates (warns if G-code exceeds machine limits)
-- Optimal rapid movement speeds in fast mode
 
 ## Examples
 
-**Basic concatenation (uses generic profile by default):**
+**Basic concatenation:**
 ```bash
 f360_fastcat input1.nc input2.nc output.nc
 ```
 
-**Enable fast mode with rapid move optimizations:**
+**Enable fast mode with feed rate optimizations:**
 ```bash
 f360_fastcat --fast input1.nc input2.nc output.nc
 ```
 
-**Use machine-specific profile:**
+**Custom safe height and travel feed rate:**
 ```bash
-f360_fastcat --machine nomad3 input1.nc input2.nc output.nc
+f360_fastcat --safe-height 10 --travel-feedrate 500 input1.nc input2.nc output.nc
 ```
 
-**Custom safe height and output directory:**
+**Verbose mode with dry run:**
 ```bash
-f360_fastcat --safe-height 10 --output-dir ~/gcode_output input1.nc input2.nc output.nc
-```
-
-**Verbose mode with log file:**
-```bash
-f360_fastcat -v --log-file process.log input1.nc input2.nc output.nc
+f360_fastcat -v --dry-run input1.nc input2.nc output.nc
 ```
 
 ## Contributing
